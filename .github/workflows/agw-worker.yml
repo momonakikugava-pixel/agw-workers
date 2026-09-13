@@ -13,7 +13,12 @@ on:
         default: ''
         type: string
       target_branch:
-        description: 'branch to check out and push back to (empty = repo default branch)'
+        description: 'branch to check out and treat as base (empty = repo default branch)'
+        required: false
+        default: ''
+        type: string
+      push_branch:
+        description: 'branch to push the agent commit to for review (empty = push directly to target_branch, current behaviour); when set and different from target_branch, a pull request is opened against target_branch instead of applying the change directly'
         required: false
         default: ''
         type: string
@@ -179,6 +184,7 @@ jobs:
         env:
           TARGET_REPO: ${{ inputs.target_repo }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
+          PUSH_BRANCH: ${{ inputs.push_branch }}
           ACC0_PAT: ${{ secrets.ACC0_PAT }}
           ACC6_PAT: ${{ secrets.ACC6_PAT }}
           ACC1_PAT: ${{ secrets.ACC1_PAT }}
@@ -191,7 +197,12 @@ jobs:
             *) echo "Unknown target_repo -- not pushing." >&2; exit 0 ;;
           esac
           cd /tmp/agent-repo
-          BRANCH="${TARGET_BRANCH:-$(git symbolic-ref --short HEAD)}"
+          BASE_BRANCH="${TARGET_BRANCH:-$(git symbolic-ref --short HEAD)}"
+          if [ -n "$PUSH_BRANCH" ]; then
+            BRANCH="$PUSH_BRANCH"
+          else
+            BRANCH="$BASE_BRANCH"
+          fi
           AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
           MAX_RETRIES=3
           total_attempts=$((MAX_RETRIES + 1))
@@ -216,21 +227,18 @@ jobs:
             if [ "$attempt" -lt "$total_attempts" ]; then
               retry_num=$attempt
               echo "Attempting retry $retry_num of $MAX_RETRIES: fetching origin/$BRANCH fresh and rebasing..."
-              if ! git -c http.https://github.com/.extraHeader="$AUTH_HEADER" fetch origin "$BRANCH"; then
-                echo "Error: Failed to fetch origin/$BRANCH on retry $retry_num." >&2
-                sleep 2
-                attempt=$((attempt + 1))
-                continue
+              if ! git -c http.https://github.com/.extraHeader="$AUTH_HEADER" fetch origin "$BRANCH" 2>/dev/null; then
+                echo "origin/$BRANCH does not exist yet (expected the first time for a new proposal branch) -- retrying the push as-is."
+              else
+                echo "Rebasing local commits onto origin/$BRANCH..."
+                if ! git rebase "origin/$BRANCH"; then
+                  echo "Error: Rebase failed (e.g. conflict detected) on retry $retry_num. Aborting rebase." >&2
+                  git rebase --abort 2>/dev/null || true
+                  exit 1
+                fi
+                echo "Rebase onto origin/$BRANCH succeeded."
               fi
-
-              echo "Rebasing local commits onto origin/$BRANCH..."
-              if ! git rebase "origin/$BRANCH"; then
-                echo "Error: Rebase failed (e.g. conflict detected) on retry $retry_num. Aborting rebase." >&2
-                git rebase --abort 2>/dev/null || true
-                exit 1
-              fi
-
-              echo "Rebase onto origin/$BRANCH succeeded. Waiting before next push attempt..."
+              echo "Waiting before next push attempt..."
               sleep 2
             fi
 
@@ -242,24 +250,51 @@ jobs:
             exit 1
           fi
 
-          # Record the agent's raw output as a file inside this same repo,
-          # using the same credential already used for the push above,
-          # instead of a public console/summary/artifact. This repo is
-          # whichever one the caller wired a token for (checkout step
-          # above) -- it may be temporarily public itself, but that is no
-          # different from the code the agent just committed being public;
-          # the point of this step is to stop the run's own console log,
-          # job summary and artifact page (which are public on ANY repo's
-          # Actions tab, private target repo or not) from being an
-          # additional, wider-audience copy of it.
+          # If this pushed to a separate proposal branch (push_branch set and
+          # different from the base branch), open a pull request instead of
+          # letting the change reach $BASE_BRANCH directly -- this is the
+          # "AGY proposes, a human/Claude approves, then it gets merged"
+          # workflow: the agent's commit lands on its own branch and a PR is
+          # opened against the base branch, but nothing is applied there
+          # until that PR is merged as a separate, later, gated step.
+          PR_URL=""
+          if [ -n "$PUSH_BRANCH" ] && [ "$PUSH_BRANCH" != "$BASE_BRANCH" ]; then
+            export GH_TOKEN="$TOKEN"
+            EXISTING_PR=$(gh pr list --repo "$TARGET_REPO" --head "$PUSH_BRANCH" --base "$BASE_BRANCH" --json url -q '.[0].url' 2>/dev/null || true)
+            if [ -n "$EXISTING_PR" ]; then
+              PR_URL="$EXISTING_PR"
+              echo "Existing PR already open: $PR_URL"
+            else
+              PR_URL=$(gh pr create --repo "$TARGET_REPO" --base "$BASE_BRANCH" --head "$PUSH_BRANCH" \
+                --title "AGY proposal: ${{ inputs.callback_id }}" \
+                --body "Proposed by AGY (callback \`${{ inputs.callback_id }}\`). Not applied to \`$BASE_BRANCH\` -- review and merge only after approval." 2>&1) || true
+              echo "Opened PR: $PR_URL"
+            fi
+          fi
+
+          # Record the agent's raw output as a file, always on $BASE_BRANCH
+          # regardless of where the code change itself went, using the same
+          # credential already used for the push above, instead of a public
+          # console/summary/artifact. This repo is whichever one the caller
+          # wired a token for (checkout step above) -- it may be temporarily
+          # public itself, but that is no different from the code the agent
+          # just committed being public; the point of this step is to stop
+          # the run's own console log, job summary and artifact page (which
+          # are public on ANY repo's Actions tab, private target repo or
+          # not) from being an additional, wider-audience copy of it.
           RUN_TAG="${{ inputs.callback_id }}"
           if [ -z "$RUN_TAG" ]; then RUN_TAG="${{ github.run_id }}"; fi
+          if [ -n "$PR_URL" ]; then
+            printf '\n---\nProposal branch: %s\nPull request: %s\n' "$PUSH_BRANCH" "$PR_URL" >> /tmp/agy_output.txt
+          fi
+          git -c http.https://github.com/.extraHeader="$AUTH_HEADER" fetch origin "$BASE_BRANCH"
+          git checkout -B "$BASE_BRANCH" "origin/$BASE_BRANCH"
           mkdir -p Reports/agy
           cp /tmp/agy_output.txt "Reports/agy/${RUN_TAG}.txt"
           git add "Reports/agy/${RUN_TAG}.txt"
           if ! git diff --cached --quiet; then
             git commit -m "agy: record raw output for ${RUN_TAG}"
-            git -c http.https://github.com/.extraHeader="$AUTH_HEADER" push origin "HEAD:$BRANCH"
+            git -c http.https://github.com/.extraHeader="$AUTH_HEADER" push origin "HEAD:$BASE_BRANCH"
             echo "output_committed=true" >> "$GITHUB_ENV"
           fi
 
